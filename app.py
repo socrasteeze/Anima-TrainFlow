@@ -21,6 +21,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import cv2
 import shutil
 from typing import Generator, List, Tuple
+import warnings
+warnings.filterwarnings("ignore", message=".*HTTP_422_UNPROCESSABLE_ENTITY.*")
 
 CSS = """
 .gradio-container {
@@ -108,6 +110,7 @@ PORTABLE_PYTHON = ROOT / "python_embeded" / "python.exe"
 TRAIN_BASE = ROOT / "training"
 OUTPUT_BASE = TRAIN_BASE / "output"
 SETTINGS_FILE = TRAIN_BASE / "settings.json"
+PRESETS_FILE = TRAIN_BASE / "presets.json"
 
 TRAIN_DIR = TRAIN_BASE / "sd-scripts" 
 TRAIN_SCRIPT = TRAIN_DIR / "anima_train_network.py"
@@ -146,6 +149,15 @@ DEFAULT_SETTINGS = {
     "tagger_char_thresh": 0.85,
     "tagger_overwrite": False
 }
+def load_presets():
+    if PRESETS_FILE.exists():
+        try:
+            with open(PRESETS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f).get("presets", [])
+        except Exception:
+            pass
+    return []
+
 def load_settings():
     settings = DEFAULT_SETTINGS.copy()
     if SETTINGS_FILE.exists():
@@ -190,6 +202,15 @@ HIDDEN_SETTINGS = {
     "sigmoid_scale": 1.3,
 }
 
+
+VALID_IMG_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
+
+def count_dataset_images(dataset_path: str) -> int:
+    # exposures-per-image formula: steps * batch * grad_accum / num_images
+    path = Path(dataset_path)
+    if not path.exists():
+        return 0
+    return len([f for f in path.glob('*') if f.is_file() and f.suffix.lower() in VALID_IMG_EXTS])
 
 def analyze_dataset_resolution(dataset_path: str) -> Tuple[int, int]:
     path = Path(dataset_path)
@@ -909,6 +930,43 @@ def handle_optimizer_change(opt, current_lr, saved_adam_lr):
     if opt == "Prodigy": return "1.0", current_lr
     return (saved_adam_lr if current_lr == "1.0" else current_lr), saved_adam_lr
 
+def suggest_steps(dataset_path, batch_size, grad_acc, target_exp):
+    n = count_dataset_images(dataset_path)
+    if n == 0:
+        return gr.update(), gr.update(), gr.update(), "No images found at dataset path."
+
+    eff_batch = max(1, int(batch_size) * int(grad_acc))
+    target = float(target_exp) if target_exp else 30.0
+
+    def to_steps(exp):
+        return max(1, round((exp * n / eff_batch) / 25) * 25)
+
+    steps = to_steps(target)
+    lo, hi = to_steps(target - 5), to_steps(target + 5)
+    cadence = max(50, round((steps / 6) / 25) * 25)
+
+    info = (f"{n} images | eff. batch {eff_batch} | target {target:.0f} exp/img\n"
+            f"Suggested: {steps} steps (band {lo}–{hi} @ {target-5:.0f}–{target+5:.0f} exp/img)\n"
+            f"Save/preview every {cadence} steps → ~{steps // cadence} checkpoints to A/B")
+
+    return gr.update(value=steps), gr.update(value=cadence), gr.update(value=cadence), info
+
+def apply_preset(name):
+    presets = {p["name"]: p for p in load_presets()}
+    p = presets.get(name)
+    if not p:
+        return tuple(gr.update() for _ in range(8))
+    return (
+        gr.update(value=p["optimizer"]),
+        gr.update(value=p["learning_rate"]),
+        gr.update(value=p["network_rank"]),
+        gr.update(value=p["training_steps"]),
+        gr.update(value=p["train_batch_size"]),
+        gr.update(value=p["gradient_accumulation_steps"]),
+        gr.update(value=p["save_steps"]),
+        gr.update(value=p["sample_steps"]),
+    )
+
 
 # ==========================================
 # UI BUILDER
@@ -940,6 +998,9 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
                     folder_btn = gr.Button("📁 Checkpoint Folder", variant="secondary")
             with gr.Column(scale=1):
                 with gr.Row():
+                    preset_dd = gr.Dropdown(label="Preset", choices=[p["name"] for p in load_presets()], value=None)
+                    apply_preset_btn = gr.Button("Apply Preset", variant="secondary")
+                with gr.Row():
                     rank_input = gr.Number(label="Network Rank", value=cs.get("network_rank", 16), precision=0)
                     lr_input = gr.Textbox(label="Learning Rate", value=cs.get("learning_rate", "1.0"))
                     optimizer_input = gr.Dropdown(label="Optimizer", choices=["Prodigy", "AdamW8bit", "AdamW"], value=cs.get("optimizer", "Prodigy"))
@@ -950,6 +1011,10 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
                     save_steps_input = gr.Number(label="Save Every n Steps", value=cs.get("save_steps", 300), precision=0)
                     sample_steps_input = gr.Number(label="Preview Every n Steps", value=cs.get("sample_steps", 300), precision=0)
                     grad_acc_input = gr.Number(label="Gradient Accumulation", value=cs.get("gradient_accumulation_steps", 1), precision=0)
+                with gr.Row():
+                    target_exp_input = gr.Number(label="Target exp/image", value=30, precision=0, min_width=120)
+                    suggest_btn = gr.Button("Suggest Steps", variant="secondary")
+                suggest_info = gr.Textbox(label="Suggestion", interactive=False, lines=3)
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -1006,7 +1071,18 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
     ui.load(fn=load_state_on_refresh, inputs=None, outputs=all_settings_list)    
 
     output_log.change(None, None, None, js=JS_SCROLL)
+    apply_preset_btn.click(
+        fn=apply_preset,
+        inputs=[preset_dd],
+        outputs=[optimizer_input, lr_input, rank_input, steps_input,
+                 batch_size_input, grad_acc_input, save_steps_input, sample_steps_input],
+    )
     optimizer_input.change(fn=handle_optimizer_change, inputs=[optimizer_input, lr_input, saved_adam_lr], outputs=[lr_input, saved_adam_lr])
+    suggest_btn.click(
+        fn=suggest_steps,
+        inputs=[dataset_path, batch_size_input, grad_acc_input, target_exp_input],
+        outputs=[steps_input, save_steps_input, sample_steps_input, suggest_info],
+    )
     
     for comp in all_settings_list: 
         comp.change(fn=auto_save_state, inputs=all_settings_list)
@@ -1034,4 +1110,4 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
     folder_btn.click(fn=open_output_folder, inputs=[trigger_word], outputs=output_log)
 
 if __name__ == "__main__":
-     ui.launch(inbrowser=True, theme=gr.themes.Soft(), css=CSS)
+     ui.launch(server_name="0.0.0.0", server_port=7860, inbrowser=True, theme=gr.themes.Soft(), css=CSS)
