@@ -790,8 +790,8 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
             full_error += "\n\n⚠️ ERROR: Please check and set the correct model paths in the section:\n'🔧 Paths to Models <- Set Once'\n\n"
         if dataset_errors:
             full_error += "\n".join(dataset_errors)
-            
-        yield full_error.strip(), gr.update()
+
+        yield full_error.strip(), gr.update(), ""
         return
 
     if not torch.cuda.is_available():
@@ -802,11 +802,11 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
             "- Training on CPU is extremely slow and is not supported by this script.\n\n"
             "Please update your NVIDIA drivers and restart the app."
         )
-        yield cuda_error, gr.update()
+        yield cuda_error, gr.update(), ""
         return
-    
+
     if training_process is not None and training_process.poll() is None:
-        yield "⚠️ Training is already running!", gr.update()
+        yield "⚠️ Training is already running!", gr.update(), ""
         return
 
     project_name = re.sub(r'[^a-zA-Z0-9]', '_', trigger_word.strip()).strip('_') or "untitled"
@@ -820,9 +820,18 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
 
     log_lines = [f"🚀 Preparing: {project_name}..."]
     last_image_count = 0
-    step_pattern = re.compile(r"(\d+)/(\d+)") 
-    
-    yield "\n".join(log_lines), gr.update()
+    step_pattern = re.compile(r"(\d+)/(\d+)")
+    # T4 ETA: matches tqdm rate lines — e.g. "500/1000 [05:12<05:12, 1.60it/s]"
+    _eta_re = re.compile(r'(\d+)/(\d+)\s*\[[\d:]+<([\d:?]+),\s*([\d.]+)(it/s|s/it)\]')
+    eta_text = ""
+
+    # T1c: bucket warning at log start (non-blocking)
+    bw = check_bucket_batch(dataset_path, batch_size, 512, 768)
+    if bw:
+        for bw_line in bw.split("\n"):
+            log_lines.append(bw_line)
+
+    yield "\n".join(log_lines), gr.update(), eta_text
 
     log_lines.append(f"🔍 Analyzing dataset images...")
     base_res, max_bucket = analyze_dataset_resolution(dataset_path)
@@ -860,8 +869,8 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
 
             if "subprocess.CalledProcessError" in line_str and "returned non-zero exit status 15" in line_str:
                 log_lines.append("🛑 Interrupted by user.")
-                yield "\n".join(log_lines), gr.update()
-                break 
+                yield "\n".join(log_lines), gr.update(), eta_text
+                break
 
             if "steps:" in line_str and "/" in line_str:
                 match = step_pattern.search(line_str)
@@ -875,28 +884,39 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
                     log_lines.append(line_str)
             else:
                 log_lines.append(line_str)
-            
+
             if len(log_lines) > MAX_LOG_LINES: del log_lines[:-MAX_LOG_LINES]
+
+            # T4: ETA from tqdm rate field
+            em = _eta_re.search(line_str)
+            if em:
+                cur_s, tot_s, _, rate_val, rate_unit = em.groups()
+                cur_i, tot_i, rate_f = int(cur_s), int(tot_s), float(rate_val)
+                if cur_i > 0 and rate_f > 0:
+                    remaining = tot_i - cur_i
+                    secs = remaining / rate_f if rate_unit == "it/s" else remaining * rate_f
+                    mins, sec = int(secs // 60), int(secs % 60)
+                    eta_text = f"≈ {mins}m {sec:02d}s remaining  ({cur_i}/{tot_i} steps)"
 
             check_image = any(x in line_str.lower() for x in ["saved", "sample", "%|", "it/s", "s/it"])
             if check_image:
                 current_images = get_latest_images(sample_dir)
                 if len(current_images) != last_image_count:
                     last_image_count = len(current_images)
-                    yield "\n".join(log_lines), current_images
+                    yield "\n".join(log_lines), current_images, eta_text
                     continue
 
-            yield "\n".join(log_lines), gr.update()
-            
+            yield "\n".join(log_lines), gr.update(), eta_text
+
         if training_process is not None:
             training_process.wait()
-            
+
         log_lines.append("✅ Process finished or stopped.")
-        yield "\n".join(log_lines), get_latest_images(sample_dir)
-        
+        yield "\n".join(log_lines), get_latest_images(sample_dir), ""
+
     except Exception as e:
         log_lines.append(f"❌ Error: {str(e)}")
-        yield "\n".join(log_lines), gr.update()
+        yield "\n".join(log_lines), gr.update(), ""
     finally:
         training_process = None
 
@@ -981,6 +1001,151 @@ def apply_preset(name):
 
 
 # ==========================================
+# T1b — Exposures / image gauge
+# ==========================================
+def compute_exp_gauge(dataset_path, steps, batch_size, grad_acc):
+    n = count_dataset_images(dataset_path)
+    if n == 0:
+        return ""
+    exp = int(steps) * int(batch_size) * int(grad_acc) / n
+    if exp <= 24:   band = "❄️ Cool"
+    elif exp <= 35: band = "✅ Healthy"
+    elif exp <= 50: band = "🔥 Warm"
+    else:           band = "💀 Fry-risk"
+    return f"{exp:.1f} exp/image — {band}  ({n} images · {int(steps)} steps · eff. batch {int(batch_size)*int(grad_acc)})"
+
+
+# ==========================================
+# T1c — Bucket-vs-batch silent failure check
+# ==========================================
+def check_bucket_batch(dataset_path, batch_size, side_min, side_max):
+    n = count_dataset_images(dataset_path)
+    if n == 0 or int(batch_size) <= 1:
+        return ""
+    path = Path(dataset_path)
+    if not path.exists():
+        return ""
+    batch = int(batch_size)
+    available_buckets = smart_cropper.get_valid_buckets(int(side_min), int(side_max))
+    bucket_counts = {}
+    for img_path in path.glob('*'):
+        if not img_path.is_file() or img_path.suffix.lower() not in VALID_IMG_EXTS:
+            continue
+        try:
+            with Image.open(img_path) as img:
+                w, h = img.size
+            bucket, _ = smart_cropper.get_best_bucket(w, h, available_buckets)
+            bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+        except Exception:
+            continue
+    thin = [(b, c) for b, c in bucket_counts.items() if c < batch]
+    if not thin:
+        return ""
+    return "\n".join(
+        f"⚠️ Bucket {bw}×{bh}: {cnt} image{'s' if cnt != 1 else ''} < batch {batch} — lower batch to {cnt} or add images at this ratio"
+        for (bw, bh), cnt in sorted(thin)
+    )
+
+
+# ==========================================
+# T2 — Analyze & Configure (chains T1a/T1b/T1c + suggest_steps + resolution)
+# ==========================================
+def analyze_and_configure(dataset_path, optimizer, batch_size, grad_acc, saved_adam_lr, side_min, side_max):
+    n = count_dataset_images(dataset_path)
+    if n == 0:
+        no = gr.update()
+        return no, no, no, no, no, no, "No images found at dataset path.", ""
+
+    base_res, max_bucket_res = analyze_dataset_resolution(dataset_path)
+
+    eff_batch = max(1, int(batch_size) * int(grad_acc))
+    target = 30.0
+    def to_steps(exp):
+        return max(1, round((exp * n / eff_batch) / 25) * 25)
+    steps = to_steps(target)
+    cadence = max(50, round((steps / 6) / 25) * 25)
+    lo, hi = to_steps(target - 5), to_steps(target + 5)
+
+    lr = "1.0" if optimizer == "Prodigy" else _adamw_lr_for_batch(batch_size)
+
+    bucket_warn = check_bucket_batch(dataset_path, batch_size, side_min, side_max)
+
+    info = (f"{n} images | eff. batch {eff_batch} | target {target:.0f} exp/img\n"
+            f"Steps: {steps} (band {lo}–{hi} @ 25–35 exp/img) | cadence: every {cadence} → ~{steps // cadence} checkpoints\n"
+            f"LR: {lr} | Resolution: base {base_res}px · max bucket {max_bucket_res}px")
+    if bucket_warn:
+        info += f"\n{bucket_warn}"
+
+    exp = steps * int(batch_size) * int(grad_acc) / n
+    if exp <= 24:   band = "❄️ Cool"
+    elif exp <= 35: band = "✅ Healthy"
+    elif exp <= 50: band = "🔥 Warm"
+    else:           band = "💀 Fry-risk"
+    gauge = f"{exp:.1f} exp/image — {band}  ({n} images · {steps} steps · eff. batch {eff_batch})"
+
+    return (gr.update(value=steps), gr.update(value=cadence), gr.update(value=cadence),
+            gr.update(value=lr), gr.update(value=base_res), gr.update(value=max_bucket_res),
+            info, gauge)
+
+
+# ==========================================
+# T3 — Post-train checkpoint A/B gallery
+# ==========================================
+def get_ab_gallery(trigger_word):
+    proj = re.sub(r'[^a-zA-Z0-9]', '_', trigger_word.strip()).strip('_') or "untitled"
+    sample_dir = OUTPUT_BASE / proj / "sample"
+    if not sample_dir.exists():
+        return []
+    images = []
+    for pattern in ('*.png', '*.jpg', '*.webp'):
+        images.extend(sample_dir.glob(pattern))
+    def parse_step(p):
+        m = re.search(r'(\d{4,8})', p.stem)
+        return int(m.group(1)) if m else 0
+    images.sort(key=lambda p: (parse_step(p), p.name))
+    out_dir = OUTPUT_BASE / proj
+    result = []
+    for img in images:
+        step = parse_step(img)
+        ckpts = sorted(out_dir.glob(f"*{step:06d}*.safetensors")) or sorted(out_dir.glob(f"*{step}*.safetensors"))
+        ckpt_name = ckpts[0].name if ckpts else "—"
+        result.append((str(img), f"Step {step} — {ckpt_name}"))
+    return result
+
+
+# ==========================================
+# Misc — Caption editor helpers
+# ==========================================
+def _list_caption_images(dataset_path):
+    path = Path(dataset_path)
+    if not path.exists():
+        return []
+    return sorted(f for f in path.glob('*') if f.is_file() and f.suffix.lower() in VALID_IMG_EXTS)
+
+def load_caption_for_edit(dataset_path, idx):
+    imgs = _list_caption_images(dataset_path)
+    if not imgs:
+        return None, "", "No images found"
+    idx = max(0, min(int(idx) - 1, len(imgs) - 1))
+    img_path = imgs[idx]
+    txt_path = img_path.with_suffix('.txt')
+    caption = txt_path.read_text(encoding='utf-8').strip() if txt_path.exists() else ""
+    return str(img_path), caption, f"{idx + 1} / {len(imgs)} — {img_path.name}"
+
+def save_caption_file(dataset_path, idx, caption_text):
+    imgs = _list_caption_images(dataset_path)
+    if not imgs:
+        return "No images found"
+    idx = max(0, min(int(idx) - 1, len(imgs) - 1))
+    imgs[idx].with_suffix('.txt').write_text(caption_text.strip(), encoding='utf-8')
+    return f"✅ Saved: {imgs[idx].name}.txt"
+
+def get_output_path(trigger_word):
+    proj = re.sub(r'[^a-zA-Z0-9]', '_', trigger_word.strip()).strip('_') or "untitled"
+    return str(OUTPUT_BASE / proj)
+
+
+# ==========================================
 # UI BUILDER
 # ==========================================
 cs = load_settings()
@@ -1000,6 +1165,8 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
                 with gr.Row():
                     trigger_word = gr.Textbox(label="Trigger Word / Project Name", value=cs.get("trigger_word", ""), placeholder="e.g., unique_style")
                     dataset_path = gr.Textbox(label="Dataset Path (Images + .txt)", value=cs.get("dataset_path", ""), placeholder="C:/Images/MyDataset")
+                with gr.Row():
+                    analyze_btn = gr.Button("🔍 Analyze & Configure", variant="secondary")
                 with gr.Accordion("🔧 Paths to Models <- Set Once", open=False):
                     dit_input = gr.Textbox(label="DiT", value=cs.get("dit_path", ""))
                     qwen_input = gr.Textbox(label="Qwen3", value=cs.get("qwen_path", ""))
@@ -1008,6 +1175,8 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
                     start_btn = gr.Button("🚀 Start Training", variant="primary")
                     stop_btn = gr.Button("🛑 Stop", variant="stop")
                     folder_btn = gr.Button("📁 Checkpoint Folder", variant="secondary")
+                    copy_path_btn = gr.Button("📋 Copy Output Path", variant="secondary")
+                output_path_display = gr.Textbox(label="Output Path", interactive=False, lines=1, elem_id="output-path-box")
             with gr.Column(scale=1):
                 with gr.Row():
                     preset_dd = gr.Dropdown(label="Preset", choices=[p["name"] for p in load_presets()], value=None)
@@ -1027,9 +1196,11 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
                     target_exp_input = gr.Number(label="Target exp/image", value=30, precision=0, min_width=120)
                     suggest_btn = gr.Button("Suggest Steps", variant="secondary")
                 suggest_info = gr.Textbox(label="Suggestion", interactive=False, lines=3)
+                exp_gauge = gr.Textbox(label="Exposures / image", interactive=False, lines=1)
 
     with gr.Row():
         with gr.Column(scale=1):
+            eta_output = gr.Textbox(label="ETA", interactive=False, lines=1)
             output_log = gr.Textbox(label="Logs", lines=LOG_BOX__MAX_LINES, max_lines=LOG_BOX__MAX_LINES, interactive=False, autoscroll=True, elem_id="log-container")
             
             with gr.Group():
@@ -1048,12 +1219,27 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
                     tagger_gen_thresh = gr.Slider(0.0, 1.0, value=cs.get("tagger_gen_thresh", 0.35), step=0.01, label="General Tags Threshold")
                     tagger_char_thresh = gr.Slider(0.0, 1.0, value=cs.get("tagger_char_thresh", 0.85), step=0.01, label="Character Tags Threshold")
                 with gr.Row():
-                    tagger_btn = gr.Button("Create .txt captions", variant="secondary")        
-                    tagger_overwrite = gr.Checkbox(label="Overwrite existing .txt", value=cs.get("tagger_overwrite", False)) 
-                
-                
+                    tagger_btn = gr.Button("Create .txt captions", variant="secondary")
+                    tagger_overwrite = gr.Checkbox(label="Overwrite existing .txt", value=cs.get("tagger_overwrite", False))
+
+            with gr.Accordion("✏️ Caption Editor", open=False):
+                with gr.Row():
+                    caption_idx = gr.Number(label="Image #", value=1, precision=0, min_width=80)
+                    caption_prev_btn = gr.Button("◀", min_width=50)
+                    caption_next_btn = gr.Button("▶", min_width=50)
+                    caption_load_btn = gr.Button("Load", variant="secondary")
+                caption_image = gr.Image(label="Image", height=200, interactive=False)
+                caption_label = gr.Textbox(label="", interactive=False, lines=1)
+                caption_text = gr.Textbox(label="Caption", lines=4, interactive=True)
+                caption_save_btn = gr.Button("💾 Save Caption", variant="primary")
+                caption_status = gr.Textbox(label="", interactive=False, lines=1)
+
+
         with gr.Column(scale=1):
-            preview_gallery = gr.Gallery(label="Previews", columns=2, rows=2, height=GALLERY_HEIGHT, object_fit="contain")
+            preview_gallery = gr.Gallery(label="Live Previews", columns=2, rows=2, height=GALLERY_HEIGHT, object_fit="contain")
+            with gr.Accordion("📸 Checkpoint A/B Gallery", open=False):
+                refresh_ab_btn = gr.Button("🔄 Refresh Gallery", variant="secondary")
+                ab_gallery = gr.Gallery(label="Samples by Step", columns=3, rows=3, height=400, object_fit="contain", show_label=False)
             with gr.Group():
                 pos_prompt = gr.Textbox(label="Prompt (Trigger word added automatically)", lines=2, value=cs.get("pos_prompt", ""))
                 neg_prompt = gr.Textbox(label="Negative Prompt", lines=1, value=cs.get("neg_prompt", ""))
@@ -1083,6 +1269,7 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
     ui.load(fn=load_state_on_refresh, inputs=None, outputs=all_settings_list)    
 
     output_log.change(None, None, None, js=JS_SCROLL)
+
     apply_preset_btn.click(
         fn=apply_preset,
         inputs=[preset_dd],
@@ -1091,13 +1278,26 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
     )
     optimizer_input.change(fn=handle_optimizer_change, inputs=[optimizer_input, lr_input, saved_adam_lr, batch_size_input], outputs=[lr_input, saved_adam_lr])
     batch_size_input.change(fn=handle_optimizer_change, inputs=[optimizer_input, lr_input, saved_adam_lr, batch_size_input], outputs=[lr_input, saved_adam_lr])
+
     suggest_btn.click(
         fn=suggest_steps,
         inputs=[dataset_path, batch_size_input, grad_acc_input, target_exp_input],
         outputs=[steps_input, save_steps_input, sample_steps_input, suggest_info],
     )
-    
-    for comp in all_settings_list: 
+
+    # T1b: live exposures/image gauge
+    _gauge_inputs = [dataset_path, steps_input, batch_size_input, grad_acc_input]
+    for _comp in _gauge_inputs:
+        _comp.change(fn=compute_exp_gauge, inputs=_gauge_inputs, outputs=[exp_gauge])
+
+    # T2: Analyze & Configure
+    analyze_btn.click(
+        fn=analyze_and_configure,
+        inputs=[dataset_path, optimizer_input, batch_size_input, grad_acc_input, saved_adam_lr, side_min_input, side_max_input],
+        outputs=[steps_input, save_steps_input, sample_steps_input, lr_input, side_min_input, side_max_input, suggest_info, exp_gauge],
+    )
+
+    for comp in all_settings_list:
         comp.change(fn=auto_save_state, inputs=all_settings_list)
 
     crop_btn.click(
@@ -1105,22 +1305,38 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
         inputs=[dataset_path, side_min_input, side_max_input, output_log],
         outputs=[output_log]
     )
-    
     open_ds_btn.click(
         fn=open_dataset_folder_ui,
         inputs=[dataset_path, output_log],
         outputs=[output_log]
     )
-    
     tagger_btn.click(
         fn=run_auto_tagging,
         inputs=[dataset_path, tagger_gen_thresh, tagger_char_thresh, tagger_overwrite, output_log],
         outputs=[output_log]
     )
-    
-    start_btn.click(fn=start_training, inputs=training_inputs, outputs=[output_log, preview_gallery])
+
+    # T3: A/B checkpoint gallery
+    refresh_ab_btn.click(fn=get_ab_gallery, inputs=[trigger_word], outputs=[ab_gallery])
+
+    # T4: ETA wired as third output of start_training
+    start_btn.click(fn=start_training, inputs=training_inputs, outputs=[output_log, preview_gallery, eta_output])
     stop_btn.click(fn=stop_training, outputs=output_log)
     folder_btn.click(fn=open_output_folder, inputs=[trigger_word], outputs=output_log)
+
+    # Misc: output path display
+    copy_path_btn.click(fn=get_output_path, inputs=[trigger_word], outputs=[output_path_display])
+    copy_path_btn.click(None, None, None, js="() => { const el = document.querySelector('#output-path-box textarea'); if(el){ navigator.clipboard.writeText(el.value); } }")
+
+    # Misc: caption editor
+    def _caption_nav(dataset_path, idx, delta):
+        imgs = _list_caption_images(dataset_path)
+        new_idx = max(1, min(int(idx) + delta, len(imgs))) if imgs else 1
+        return new_idx
+    caption_load_btn.click(fn=load_caption_for_edit, inputs=[dataset_path, caption_idx], outputs=[caption_image, caption_text, caption_label])
+    caption_prev_btn.click(fn=lambda d, i: _caption_nav(d, i, -1), inputs=[dataset_path, caption_idx], outputs=[caption_idx]).then(fn=load_caption_for_edit, inputs=[dataset_path, caption_idx], outputs=[caption_image, caption_text, caption_label])
+    caption_next_btn.click(fn=lambda d, i: _caption_nav(d, i, +1), inputs=[dataset_path, caption_idx], outputs=[caption_idx]).then(fn=load_caption_for_edit, inputs=[dataset_path, caption_idx], outputs=[caption_image, caption_text, caption_label])
+    caption_save_btn.click(fn=save_caption_file, inputs=[dataset_path, caption_idx, caption_text], outputs=[caption_status])
 
 if __name__ == "__main__":
      ui.launch(server_name="0.0.0.0", server_port=7860, inbrowser=True, theme=gr.themes.Soft(), css=CSS)

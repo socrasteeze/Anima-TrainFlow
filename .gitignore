@@ -1,0 +1,7 @@
+python_embeded/
+models/
+training/output/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
