@@ -11,7 +11,7 @@ A single-page Gradio GUI for training LoRA adapters on the **Anima 2B** diffusio
 ## Project Layout
 
 ```
-app.py                          # Entire application (~1100 lines, single file)
+app.py                          # Entire application (~1340 lines, single file)
 start_trainer.bat               # Launcher — calls python_embeded/python.exe app.py
 Install_Requirements.bat        # One-time dependency installer
 training/
@@ -45,14 +45,15 @@ The entire application is one file. Key sections by line range:
 
 | Lines | Section |
 |-------|---------|
-| 1–150 | Imports, CSS/JS, constants, path setup |
-| 152–203 | Settings load/save; hidden training params (BF16, scheduler, etc.) |
-| 208–350 | Dataset utilities and TOML config generators |
-| 352–450 | Gallery refresh, bucket summary, log filtering |
-| 453–645 | Smart crop — multi-threaded U2Net subject-aware cropping |
-| 648–725 | Auto-tag — multi-threaded WD14 captioning |
-| 745–970 | Training start/stop, validation, subprocess launch |
-| 971–1112 | Gradio UI builder |
+| 1–122 | Imports, CSS/JS, constants, path setup |
+| 124–203 | Settings load/save; hidden training params (BF16, scheduler, etc.) |
+| 206–353 | Dataset utilities and TOML config generators |
+| 355–453 | Gallery refresh, bucket summary, log filtering |
+| 366–558 | Smart crop — `SmartCropper` (U2Net) class + multi-threaded crop pipeline |
+| 564–727 | Auto-tag — `WDTagger` (WD14) class + multi-threaded captioning |
+| 730–963 | Training start/stop, validation, subprocess launch; suggestion/gauge helpers |
+| 965–1145 | Analysis (exposures gauge, suggest steps, analyze & configure), caption editor helpers |
+| 1153–1341 | Gradio UI builder |
 
 Training is launched as a subprocess via `accelerate launch anima_train_network.py`. Logs are streamed back and filtered through a Gradio Textbox.
 
@@ -75,11 +76,13 @@ Hidden defaults (not exposed in UI) are set in the `HIDDEN_SETTINGS` dict near t
 
 - `mixed_precision`: `bf16`
 - `gradient_checkpointing`: `true`
-- `lr_scheduler`: `rex`
+- `lr_scheduler`: `cosine`
 - `cache_latents`: `true`
 - `cache_text_encoder_outputs`: `true`
 
-Exposed parameters: trigger word, dataset path, rank, network alpha, LR, steps, batch size, gradient accumulation, save/sample every N steps, optimizer.
+Exposed parameters: trigger word, dataset path, rank, LR, steps, batch size, gradient accumulation, save/sample every N steps, optimizer.
+
+Network alpha is **not** exposed — it is auto-derived as `network_alpha = network_rank` in `create_training_toml()`.
 
 ---
 
@@ -99,8 +102,9 @@ Exposed parameters: trigger word, dataset path, rank, network alpha, LR, steps, 
 
 - **Preset system** — Dropdown loads named configs from `training/presets.json`, overwriting optimizer, LR, rank, batch, steps, and cadence fields.
 - **Step suggestion helper** — Calculates steps from image count × target exposures per image; suggests save/preview cadence for ~6 checkpoints.
-
-Specification docs for these features are in `atf_PRESETS_BRIEF.md` and `atf_SUGGEST_STEPS_BRIEF.md`.
+- **Analyze & Configure** — One click reads the dataset, suggests steps/cadence/LR, detects resolution, and warns on bucket-vs-batch mismatches.
+- **Exposures gauge** — Live overfit-risk readout (`steps × batch × grad_accum / num_images`) with health bands.
+- **A/B checkpoint gallery** — Scans output samples, groups by step, and pairs each with its `.safetensors` checkpoint for review.
 
 ---
 
