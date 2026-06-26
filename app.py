@@ -301,9 +301,11 @@ def create_training_toml(project_name, config_save_dir, actual_output_dir, rank,
     opt_args = ["weight_decay=0.01"]
     if optimizer == "Prodigy":
         scheduler = "constant"
+        lr_warmup = None  # schedule-free; warmup handled internally by safeguard_warmup
         opt_args = ["decouple=True", "weight_decay=0.01", "d_coef=1.0", "use_bias_correction=True", "safeguard_warmup=True", "betas=0.9,0.99"]
     else:
         scheduler = "cosine"
+        lr_warmup = 0.1  # 10% warmup — backend accepts float ratio
 
     training_config = {
         "pretrained_model_name_or_path": Path(models["dit_path"]).resolve().as_posix(),
@@ -319,6 +321,7 @@ def create_training_toml(project_name, config_save_dir, actual_output_dir, rank,
         "optimizer_type": optimizer,
         "optimizer_args": opt_args,
         "lr_scheduler": scheduler,
+        **({"lr_warmup_steps": lr_warmup} if lr_warmup is not None else {}),
         "max_train_steps": int(max_steps),
         "train_batch_size": int(batch_size),
         "gradient_accumulation_steps": int(grad_acc),
@@ -926,9 +929,18 @@ def open_output_folder(trigger_word):
     else: subprocess.Popen(["xdg-open", str(target_dir)])
     return "📁 Folder opened."
 
-def handle_optimizer_change(opt, current_lr, saved_adam_lr):
-    if opt == "Prodigy": return "1.0", current_lr
-    return (saved_adam_lr if current_lr == "1.0" else current_lr), saved_adam_lr
+# Heuristic starting points anchored to batch-4 figures from the Anima training post
+_ADAMW_LR_BY_BATCH = {1: "0.00005", 2: "0.00006", 4: "0.00008", 8: "0.00012"}
+
+def _adamw_lr_for_batch(batch_size):
+    batch = max(1, int(batch_size))
+    nearest = min(_ADAMW_LR_BY_BATCH.keys(), key=lambda k: abs(k - batch))
+    return _ADAMW_LR_BY_BATCH[nearest]
+
+def handle_optimizer_change(opt, current_lr, saved_adam_lr, batch_size):
+    if opt == "Prodigy":
+        return "1.0", current_lr  # save current lr so it can be restored if user switches back
+    return _adamw_lr_for_batch(batch_size), saved_adam_lr
 
 def suggest_steps(dataset_path, batch_size, grad_acc, target_exp):
     n = count_dataset_images(dataset_path)
@@ -1077,7 +1089,8 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
         outputs=[optimizer_input, lr_input, rank_input, steps_input,
                  batch_size_input, grad_acc_input, save_steps_input, sample_steps_input],
     )
-    optimizer_input.change(fn=handle_optimizer_change, inputs=[optimizer_input, lr_input, saved_adam_lr], outputs=[lr_input, saved_adam_lr])
+    optimizer_input.change(fn=handle_optimizer_change, inputs=[optimizer_input, lr_input, saved_adam_lr, batch_size_input], outputs=[lr_input, saved_adam_lr])
+    batch_size_input.change(fn=handle_optimizer_change, inputs=[optimizer_input, lr_input, saved_adam_lr, batch_size_input], outputs=[lr_input, saved_adam_lr])
     suggest_btn.click(
         fn=suggest_steps,
         inputs=[dataset_path, batch_size_input, grad_acc_input, target_exp_input],
