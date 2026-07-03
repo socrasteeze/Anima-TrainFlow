@@ -2,7 +2,7 @@
 
 Design law for this app: **remove a decision, don't add an option.** Every enhancement automates expert knowledge and surfaces it as an editable default. No raw knobs the user must already understand. The suggest-steps helper is the template — follow it.
 
-> **Status (2026-07-02):** All planned tiers (W, T1a–T1c, T2, T3 MVP, T4) plus the misc items shipped in commits `78505014` and `252b4d0f`. A code review verified every feature against its spec — implementations are correct and the settings zip-mapping is intact (26 keys, order preserved). What remains: the fix-ups found in review (below), git hygiene, and the optional T3 Phase 2.
+> **Status (2026-07-02):** All planned tiers (W, T1a–T1c, T2, T3 MVP, T4) plus the misc items shipped in commits `78505014` and `252b4d0f`. A code review verified every feature against its spec — implementations are correct and the settings zip-mapping is intact (26 keys, order preserved). The six review fix-ups (F1–F6) are now applied and verified, and git hygiene is done. **Only optional work remains: T3 Phase 2 (re-inference A/B), or stop — the tool is feature-complete for its design law.**
 
 ---
 
@@ -30,27 +30,16 @@ Design law for this app: **remove a decision, don't add an option.** Every enhan
 
 ---
 
-## FIX-UPS — found in 2026-07-02 code review (do these first)
+## FIX-UPS — found in 2026-07-02 code review — ✅ ALL RESOLVED (verified same day)
 
-### F1. Bucket check at training start uses hardcoded sides — app.py:829
-`check_bucket_batch(dataset_path, batch_size, 512, 768)` ignores the user's actual Min/Max Side settings (e.g. current settings.json has 512/1024), so the warning can be wrong both ways.
-- Fix: pass real values — `start_btn.click(inputs=training_inputs + [side_min_input, side_max_input], ...)` and extend `start_training`'s signature. Do **not** add them to `training_inputs` itself (that list is a prefix of `all_settings_list`; growing it corrupts the settings zip-mapping).
+Fixed and verified by importing the real functions and asserting behavior (12/12 checks pass; the UI graph also rebuilds cleanly with the rewired handlers). Settings zip-mapping left intact — `training_inputs` (21) and `all_settings_list` (26) were not touched.
 
-### F2. T2 computes the bucket warning against stale sides — app.py:1071
-`analyze_and_configure` overwrites the side fields with `base_res`/`max_bucket_res` but calls `check_bucket_batch` with the *incoming* `side_min`/`side_max`. Call it with the freshly computed values so the warning matches what the fields will say.
-
-### F3. T2 ignores the "Target exp/image" field
-`analyze_and_configure` hardcodes `target = 30.0` while the Suggest Steps button honors `target_exp_input`. Wire `target_exp_input` into the analyze click inputs for consistency (still defaults to 30).
-
-### F4. Gauge crashes on empty numeric fields
-`compute_exp_gauge` does `int(steps)` etc.; clearing a Number field mid-edit passes `None` → TypeError toast. Guard: bail early (return `""`) if any input is `None`.
-
-### F5. T3 step parser digit edge case — app.py:1102
-`parse_step` grabs the *first* 4–8 digit run in the stem. Sample files are `{project}_{step:06d}_{i:02d}_{timestamp}.png`, so a project name containing 4+ consecutive digits (e.g. trigger word `style2024`) misparses. Anchor to the `_({6}\d)_` step field or skip the project-name prefix.
-
-### F6. Cosmetic dead code
-- `saved_adam_lr` state is vestigial: `handle_optimizer_change` always takes the table LR when leaving Prodigy, never restores the saved one. Either restore the saved LR (pre-T1a behavior) or drop the state.
-- `analyze_and_configure` accepts `saved_adam_lr` but never uses it.
+- [x] **F1.** Bucket check at training start no longer hardcodes `512, 768` — `start_training` gained `side_min/side_max` params (defaults 512/768) and the click passes `training_inputs + [side_min_input, side_max_input]`. `training_inputs` itself untouched, so the zip-mapping is safe.
+- [x] **F2.** `analyze_and_configure` now runs `check_bucket_batch` against the freshly computed `base_res`/`max_bucket_res` (what the side fields become), not the stale incoming values.
+- [x] **F3.** `analyze_and_configure` honors `target_exp_input` (`float(target_exp) if target_exp else 30.0`), consistent with Suggest Steps.
+- [x] **F4.** `compute_exp_gauge` returns `""` when steps/batch/grad-acc is `None` (a cleared Number field), so mid-edit no longer raises a TypeError toast.
+- [x] **F5.** `parse_step` anchors on the fixed `_{step:06d}_{i:02d}_{14-digit-timestamp}` tail, so digit-bearing project names (`style2024`, `test_123456`) and seed suffixes parse correctly; legacy fallback retained.
+- [x] **F6.** Dead `saved_adam_lr` `gr.State` removed; `handle_optimizer_change` simplified to `(opt, batch_size) -> lr` (auto-LR is the intended behavior, save/restore was vestigial); `analyze_and_configure` no longer takes the unused param.
 
 ### Known limitation (documented, not a bug to fix now)
 T1c approximates sd-scripts *training* bucketing with the SmartCropper's *crop* buckets. Exact when the dataset was smart-cropped in-app (images land precisely on crop buckets); can misgroup for datasets cropped elsewhere. A faithful check would group by exact image dims (post-crop dims are already 64-multiples) under `bucket_no_upscale=True` rules from `create_dataset_toml`.
@@ -59,9 +48,9 @@ T1c approximates sd-scripts *training* bucketing with the SmartCropper's *crop* 
 
 ## GIT HYGIENE — repo state, not code
 
-- [ ] **Untrack `python_embeded/`** — it's gitignored but ~996 files are still tracked from an old commit, which is why `git status` is flooded with noise. Run: `git rm -r --cached python_embeded/` then commit. History keeps the blobs but the working tree stops churning.
-- [ ] **Decide on `models/*/put_model_here` placeholders** — tracked upstream, deleted locally (unstaged `D`). Either restore (`git checkout -- models/`) so fresh clones get the directory skeleton, or commit the deletions deliberately.
-- [ ] **Commit the untracked docs** — `atf_PRESETS_BRIEF.md`, `atf_SUGGEST_STEPS_BRIEF.md` (both now carry an IMPLEMENTED status header), plus this TODO.md/CLAUDE.md refresh.
+- [x] **Untracked `python_embeded/`** — 996 files removed from the index via `git rm -r --cached` (commit `31d979cc`); blobs stay in history, working tree is quiet.
+- [x] **`models/*/put_model_here` placeholders** — restored (`git checkout -- models/`) so fresh clones keep the directory skeleton.
+- [x] **Committed the docs** — `atf_*.md` briefs (IMPLEMENTED headers), TODO.md, CLAUDE.md refresh (commit `11866fdd`).
 - [x] `training/settings.json` is machine-specific state (absolute local paths) — added to `.gitignore`; removed from CLAUDE.md's commit list. Do not commit it.
 
 ---
@@ -105,4 +94,4 @@ Inventoried bundled `library/optimizer.py` (Anima fork shares the upstream kohya
 - `training/settings.json` is local state: never commit it, never hand-edit expectations into it.
 
 ## Recommended order
-F1–F5 (small, sharp fixes — one sitting) → git hygiene (one commit each for untracking and docs) → then either T3 Phase 2 or stop; the tool is feature-complete for its design law.
+~~F1–F6~~ ✅ done · ~~git hygiene~~ ✅ done → then either T3 Phase 2 or stop; the tool is feature-complete for its design law.

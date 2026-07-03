@@ -745,7 +745,7 @@ def open_dataset_folder_ui(dataset_dir, current_logs):
 # TRAINING FUNCTIONS
 # ==========================================
 
-def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, optimizer, t_steps, save_steps, sample_steps, pos, neg, w, h, s_steps_gen, s_cfg, s_seed, train_seed, batch_size, grad_acc):
+def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, optimizer, t_steps, save_steps, sample_steps, pos, neg, w, h, s_steps_gen, s_cfg, s_seed, train_seed, batch_size, grad_acc, side_min=512, side_max=768):
     global training_process
 
     model_errors = []
@@ -825,8 +825,8 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
     _eta_re = re.compile(r'(\d+)/(\d+)\s*\[[\d:]+<([\d:?]+),\s*([\d.]+)(it/s|s/it)\]')
     eta_text = ""
 
-    # T1c: bucket warning at log start (non-blocking)
-    bw = check_bucket_batch(dataset_path, batch_size, 512, 768)
+    # T1c: bucket warning at log start (non-blocking) — use the user's actual Min/Max Side
+    bw = check_bucket_batch(dataset_path, batch_size, side_min, side_max)
     if bw:
         for bw_line in bw.split("\n"):
             log_lines.append(bw_line)
@@ -957,10 +957,12 @@ def _adamw_lr_for_batch(batch_size):
     nearest = min(_ADAMW_LR_BY_BATCH.keys(), key=lambda k: abs(k - batch))
     return _ADAMW_LR_BY_BATCH[nearest]
 
-def handle_optimizer_change(opt, current_lr, saved_adam_lr, batch_size):
+def handle_optimizer_change(opt, batch_size):
+    # auto-LR (T1a): Prodigy is schedule-free (fixed 1.0); AdamW LR comes from the batch table.
+    # Only sets the default on optimizer/batch change — the field stays editable afterward.
     if opt == "Prodigy":
-        return "1.0", current_lr  # save current lr so it can be restored if user switches back
-    return _adamw_lr_for_batch(batch_size), saved_adam_lr
+        return "1.0"
+    return _adamw_lr_for_batch(batch_size)
 
 def suggest_steps(dataset_path, batch_size, grad_acc, target_exp):
     n = count_dataset_images(dataset_path)
@@ -1004,6 +1006,8 @@ def apply_preset(name):
 # T1b — Exposures / image gauge
 # ==========================================
 def compute_exp_gauge(dataset_path, steps, batch_size, grad_acc):
+    if steps is None or batch_size is None or grad_acc is None:
+        return ""  # a Number field cleared mid-edit passes None — don't raise a TypeError toast
     n = count_dataset_images(dataset_path)
     if n == 0:
         return ""
@@ -1050,7 +1054,7 @@ def check_bucket_batch(dataset_path, batch_size, side_min, side_max):
 # ==========================================
 # T2 — Analyze & Configure (chains T1a/T1b/T1c + suggest_steps + resolution)
 # ==========================================
-def analyze_and_configure(dataset_path, optimizer, batch_size, grad_acc, saved_adam_lr, side_min, side_max):
+def analyze_and_configure(dataset_path, optimizer, batch_size, grad_acc, target_exp):
     n = count_dataset_images(dataset_path)
     if n == 0:
         no = gr.update()
@@ -1059,7 +1063,7 @@ def analyze_and_configure(dataset_path, optimizer, batch_size, grad_acc, saved_a
     base_res, max_bucket_res = analyze_dataset_resolution(dataset_path)
 
     eff_batch = max(1, int(batch_size) * int(grad_acc))
-    target = 30.0
+    target = float(target_exp) if target_exp else 30.0
     def to_steps(exp):
         return max(1, round((exp * n / eff_batch) / 25) * 25)
     steps = to_steps(target)
@@ -1068,7 +1072,8 @@ def analyze_and_configure(dataset_path, optimizer, batch_size, grad_acc, saved_a
 
     lr = "1.0" if optimizer == "Prodigy" else _adamw_lr_for_batch(batch_size)
 
-    bucket_warn = check_bucket_batch(dataset_path, batch_size, side_min, side_max)
+    # check against the resolution we're about to write into the side fields, not the stale ones
+    bucket_warn = check_bucket_batch(dataset_path, batch_size, base_res, max_bucket_res)
 
     info = (f"{n} images | eff. batch {eff_batch} | target {target:.0f} exp/img\n"
             f"Steps: {steps} (band {lo}–{hi} @ 25–35 exp/img) | cadence: every {cadence} → ~{steps // cadence} checkpoints\n"
@@ -1100,6 +1105,11 @@ def get_ab_gallery(trigger_word):
     for pattern in ('*.png', '*.jpg', '*.webp'):
         images.extend(sample_dir.glob(pattern))
     def parse_step(p):
+        # sample files: {project}_{step:06d}_{i:02d}_{YYYYMMDDHHMMSS}[_{seed}].png
+        # anchor on the fixed index_timestamp tail so a digit-bearing project name can't shadow the step
+        m = re.search(r'_(\d{6,})_\d{2}_\d{8,}', p.stem)
+        if m:
+            return int(m.group(1))
         m = re.search(r'(\d{4,8})', p.stem)
         return int(m.group(1)) if m else 0
     images.sort(key=lambda p: (parse_step(p), p.name))
@@ -1157,8 +1167,6 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
         elem_id="main-header"
     )
     
-    saved_adam_lr = gr.State(value="0.00005")
-
     with gr.Group():
         with gr.Row():
             with gr.Column(scale=1):
@@ -1276,8 +1284,8 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
         outputs=[optimizer_input, lr_input, rank_input, steps_input,
                  batch_size_input, grad_acc_input, save_steps_input, sample_steps_input],
     )
-    optimizer_input.change(fn=handle_optimizer_change, inputs=[optimizer_input, lr_input, saved_adam_lr, batch_size_input], outputs=[lr_input, saved_adam_lr])
-    batch_size_input.change(fn=handle_optimizer_change, inputs=[optimizer_input, lr_input, saved_adam_lr, batch_size_input], outputs=[lr_input, saved_adam_lr])
+    optimizer_input.change(fn=handle_optimizer_change, inputs=[optimizer_input, batch_size_input], outputs=[lr_input])
+    batch_size_input.change(fn=handle_optimizer_change, inputs=[optimizer_input, batch_size_input], outputs=[lr_input])
 
     suggest_btn.click(
         fn=suggest_steps,
@@ -1293,7 +1301,7 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
     # T2: Analyze & Configure
     analyze_btn.click(
         fn=analyze_and_configure,
-        inputs=[dataset_path, optimizer_input, batch_size_input, grad_acc_input, saved_adam_lr, side_min_input, side_max_input],
+        inputs=[dataset_path, optimizer_input, batch_size_input, grad_acc_input, target_exp_input],
         outputs=[steps_input, save_steps_input, sample_steps_input, lr_input, side_min_input, side_max_input, suggest_info, exp_gauge],
     )
 
@@ -1320,7 +1328,7 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
     refresh_ab_btn.click(fn=get_ab_gallery, inputs=[trigger_word], outputs=[ab_gallery])
 
     # T4: ETA wired as third output of start_training
-    start_btn.click(fn=start_training, inputs=training_inputs, outputs=[output_log, preview_gallery, eta_output])
+    start_btn.click(fn=start_training, inputs=training_inputs + [side_min_input, side_max_input], outputs=[output_log, preview_gallery, eta_output])
     stop_btn.click(fn=stop_training, outputs=output_log)
     folder_btn.click(fn=open_output_folder, inputs=[trigger_word], outputs=output_log)
 
