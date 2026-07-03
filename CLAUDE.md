@@ -11,7 +11,7 @@ A single-page Gradio GUI for training LoRA adapters on the **Anima 2B** diffusio
 ## Project Layout
 
 ```
-app.py                          # Entire application (~1100 lines, single file)
+app.py                          # Entire application (~1340 lines, single file)
 start_trainer.bat               # Launcher — calls python_embeded/python.exe app.py
 Install_Requirements.bat        # One-time dependency installer
 training/
@@ -45,14 +45,16 @@ The entire application is one file. Key sections by line range:
 
 | Lines | Section |
 |-------|---------|
-| 1–150 | Imports, CSS/JS, constants, path setup |
-| 152–203 | Settings load/save; hidden training params (BF16, scheduler, etc.) |
-| 208–350 | Dataset utilities and TOML config generators |
-| 352–450 | Gallery refresh, bucket summary, log filtering |
-| 453–645 | Smart crop — multi-threaded U2Net subject-aware cropping |
-| 648–725 | Auto-tag — multi-threaded WD14 captioning |
-| 745–970 | Training start/stop, validation, subprocess launch |
-| 971–1112 | Gradio UI builder |
+| 1–123 | Imports, CSS/JS, constants, path setup |
+| 124–203 | Settings load/save, presets loader, `HIDDEN_SETTINGS` |
+| 206–352 | Dataset utilities and TOML config generators |
+| 355–558 | Preview gallery + smart crop — multi-threaded U2Net subject-aware cropping |
+| 561–742 | Auto-tag — multi-threaded WD14 captioning |
+| 744–950 | Training start/stop, validation, subprocess launch, log stream + ETA |
+| 952–1145 | Config helpers: auto-LR table, suggest-steps, presets, exp gauge, bucket check, Analyze & Configure, A/B gallery, caption editor |
+| 1148–1342 | Gradio UI builder and event wiring |
+
+Two index-coupled lists in the UI builder are load-bearing: `training_inputs` (feeds `start_training` positionally) is a prefix of `all_settings_list`, which must stay index-aligned with `DEFAULT_SETTINGS.keys()` (the `auto_save_state` zip-mapping). Append new persisted keys at the end of both; never reorder. Extra event inputs go in at the `.click` site as `training_inputs + [extra, ...]`, not into the lists.
 
 Training is launched as a subprocess via `accelerate launch anima_train_network.py`. Logs are streamed back and filtered through a Gradio Textbox.
 
@@ -75,11 +77,12 @@ Hidden defaults (not exposed in UI) are set in the `HIDDEN_SETTINGS` dict near t
 
 - `mixed_precision`: `bf16`
 - `gradient_checkpointing`: `true`
-- `lr_scheduler`: `rex`
 - `cache_latents`: `true`
 - `cache_text_encoder_outputs`: `true`
 
-Exposed parameters: trigger word, dataset path, rank, network alpha, LR, steps, batch size, gradient accumulation, save/sample every N steps, optimizer.
+The LR scheduler is NOT taken from `HIDDEN_SETTINGS` (its `lr_scheduler` key is unused) — it's chosen per optimizer inside `create_training_toml`: `constant` for Prodigy (schedule-free, `safeguard_warmup=True`), `cosine` with `lr_warmup_steps = 0.1` (10% float ratio) for AdamW/AdamW8bit. `network_alpha` is hardcoded equal to rank by design (see TODO.md "DROPPED").
+
+Exposed parameters: trigger word, dataset path, rank, LR, steps, batch size, gradient accumulation, save/sample every N steps, optimizer. LR and steps are auto-populated (auto-LR from optimizer × batch; suggest-steps / Analyze & Configure) but remain editable.
 
 ---
 
@@ -97,10 +100,20 @@ Exposed parameters: trigger word, dataset path, rank, network alpha, LR, steps, 
 
 ## Recent Features
 
-- **Preset system** — Dropdown loads named configs from `training/presets.json`, overwriting optimizer, LR, rank, batch, steps, and cadence fields.
-- **Step suggestion helper** — Calculates steps from image count × target exposures per image; suggests save/preview cadence for ~6 checkpoints.
+All implemented and verified (2026-07-02 review); see TODO.md for per-feature line references and open fix-ups:
 
-Specification docs for these features are in `atf_PRESETS_BRIEF.md` and `atf_SUGGEST_STEPS_BRIEF.md`.
+- **Preset system** — Dropdown loads named configs from `training/presets.json`, overwriting optimizer, LR, rank, batch, steps, and cadence fields.
+- **Step suggestion helper** — Steps from image count × target exposures per image; suggests save/preview cadence for ~6 checkpoints.
+- **Auto-LR** — LR populates from optimizer × batch size (`_ADAMW_LR_BY_BATCH`); Prodigy pins `1.0`.
+- **Baked-in warmup** — 10% LR warmup on the cosine branch, invisible to the user.
+- **Exposures/image gauge** — live readout of the governing overfit metric with cool/healthy/warm/fry bands.
+- **Bucket-vs-batch warning** — flags buckets thinner than the batch size (non-blocking).
+- **Analyze & Configure** — one click chains resolution analysis, suggest-steps, auto-LR, bucket check, and the gauge.
+- **Checkpoint A/B gallery** — post-train gallery of sample images grouped by step, labeled with the matching `.safetensors`.
+- **Training ETA** — parsed from tqdm rate lines in the streamed log.
+- **Caption editor** — per-image `.txt` viewing/editing in an accordion.
+
+Specification docs (historical, both fully implemented): `atf_PRESETS_BRIEF.md` and `atf_SUGGEST_STEPS_BRIEF.md`.
 
 ---
 
@@ -115,8 +128,10 @@ Specification docs for these features are in `atf_PRESETS_BRIEF.md` and `atf_SUG
 Only commit enhancements and deliberate changes — source files that you authored or modified:
 
 - `app.py`
-- `training/presets.json`, `training/settings.json`
+- `training/presets.json`
 - `training/sd-scripts/` source files
 - Top-level docs and config (`README.md`, `CLAUDE.md`, `TODO.md`, `*.bat`, `*.md`)
 
-**Do not commit anything under `python_embeded/`** — that entire directory is the portable Python runtime populated by `pip install` and `Install_Requirements.bat`. Its churn is meaningless noise in git history. If it isn't already in `.gitignore`, add it.
+**Do not commit `training/settings.json`** — it is auto-saved per-user state containing machine-specific absolute paths. It is in `.gitignore`.
+
+**Do not commit anything under `python_embeded/`** — that entire directory is the portable Python runtime populated by `pip install` and `Install_Requirements.bat`. It is in `.gitignore`, but ~1000 files remain tracked from an old commit (hence the noisy `git status`); untracking them (`git rm -r --cached python_embeded/`) is an open task in TODO.md.
