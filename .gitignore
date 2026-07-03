@@ -1,6 +1,7 @@
 python_embeded/
 models/
 training/output/
+training/settings.json
 __pycache__/
 *.pyc
 *.pyo
