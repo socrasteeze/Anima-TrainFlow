@@ -134,4 +134,4 @@ Only commit enhancements and deliberate changes — source files that you author
 
 **Do not commit `training/settings.json`** — it is auto-saved per-user state containing machine-specific absolute paths. It is in `.gitignore`.
 
-**Do not commit anything under `python_embeded/`** — that entire directory is the portable Python runtime populated by `pip install` and `Install_Requirements.bat`. It is in `.gitignore`, but ~1000 files remain tracked from an old commit (hence the noisy `git status`); untracking them (`git rm -r --cached python_embeded/`) is an open task in TODO.md.
+**Do not commit anything under `python_embeded/`** — that entire directory is the portable Python runtime populated by `pip install` and `Install_Requirements.bat`. It is in `.gitignore` and no longer tracked (untracked via `git rm -r --cached python_embeded/` in commit `31d979cc`); the working tree is quiet.
