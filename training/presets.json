@@ -12,17 +12,6 @@
       "sample_steps": 250
     },
     {
-      "name": "Style — AdamW8bit (low VRAM)",
-      "optimizer": "AdamW8bit",
-      "learning_rate": "0.00008",
-      "network_rank": 16,
-      "training_steps": 1000,
-      "train_batch_size": 2,
-      "gradient_accumulation_steps": 2,
-      "save_steps": 250,
-      "sample_steps": 250
-    },
-    {
       "name": "Prodigy (default / auto-LR)",
       "optimizer": "Prodigy",
       "learning_rate": "1.0",

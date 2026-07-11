@@ -117,6 +117,16 @@ TRAIN_SCRIPT = TRAIN_DIR / "anima_train_network.py"
 
 training_process = None
 
+# Module-level training state, decoupled from any single Gradio request/generator
+# so a page refresh doesn't sever the connection to a still-running subprocess.
+training_state_lock = threading.Lock()
+training_active = False
+training_log_lines = []
+training_eta_text = ""
+training_sample_dir = None
+training_last_image_count = 0
+training_log_file = None
+
 for d in [TRAIN_BASE, OUTPUT_BASE]:
     d.mkdir(parents=True, exist_ok=True)
 
@@ -292,7 +302,7 @@ def create_dataset_toml(project_name, dataset_path, trigger_word, base_res, max_
         toml.dump(dataset_config, f)
     return str(config_path)
 
-def create_training_toml(project_name, config_save_dir, actual_output_dir, rank, lr, optimizer, max_steps, save_steps, sample_steps, models, prompt_path, train_seed, batch_size, grad_acc):
+def create_training_toml(project_name, config_save_dir, actual_output_dir, rank, lr, optimizer, max_steps, save_steps, sample_steps, models, prompt_path, train_seed, batch_size, grad_acc, skip_cache_check=False):
     config_path = config_save_dir / f"{project_name}_training.toml"
 
     network_rank = int(rank)
@@ -340,6 +350,10 @@ def create_training_toml(project_name, config_save_dir, actual_output_dir, rank,
         "cache_latents_to_disk": True,
         "cache_text_encoder_outputs": True,
         "cache_text_encoder_outputs_to_disk": True,
+        "save_state": True,
+        "save_last_n_steps_state": 1,
+        "save_state_on_train_end": True,
+        "skip_cache_check": bool(skip_cache_check),
         "attn_mode": "sdpa",
         "save_model_as": "safetensors",
         "save_precision": "bf16",
@@ -745,22 +759,104 @@ def open_dataset_folder_ui(dataset_dir, current_logs):
 # TRAINING FUNCTIONS
 # ==========================================
 
-def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, optimizer, t_steps, save_steps, sample_steps, pos, neg, w, h, s_steps_gen, s_cfg, s_seed, train_seed, batch_size, grad_acc, side_min=512, side_max=768):
-    global training_process
+_STEP_PATTERN = re.compile(r"(\d+)/(\d+)")
+# T4 ETA: matches tqdm rate lines — e.g. "500/1000 [05:12<05:12, 1.60it/s]"
+_ETA_RE = re.compile(r'(\d+)/(\d+)\s*\[[\d:]+<([\d:?]+),\s*([\d.]+)(it/s|s/it)\]')
+
+
+def _training_worker(log_file_path):
+    """Runs in a background thread, independent of any Gradio request, so a page
+    refresh (which cancels the in-flight click generator) can't stop log/ETA/preview
+    updates or leave the subprocess's stdout pipe undrained."""
+    global training_process, training_active, training_eta_text
+
+    log_fh = open(log_file_path, "a", encoding="utf-8", errors="ignore")
+    try:
+        for line in iter(training_process.stdout.readline, ""):
+            line_str = line.replace('\r', '').strip()
+            if not line_str: continue
+            if any(skip_word in line_str for skip_word in LOG_BLACKLIST): continue
+
+            log_fh.write(line_str + "\n")
+            log_fh.flush()
+
+            with training_state_lock:
+                if "subprocess.CalledProcessError" in line_str and "returned non-zero exit status 15" in line_str:
+                    training_log_lines.append("🛑 Interrupted by user.")
+                    break
+
+                if "steps:" in line_str and "/" in line_str:
+                    match = _STEP_PATTERN.search(line_str)
+                    if match:
+                        current_step_info = match.group(0)
+                        if training_log_lines and "steps:" in training_log_lines[-1] and current_step_info in training_log_lines[-1]:
+                            training_log_lines[-1] = line_str
+                        else:
+                            training_log_lines.append(line_str)
+                    else:
+                        training_log_lines.append(line_str)
+                else:
+                    training_log_lines.append(line_str)
+
+                if len(training_log_lines) > MAX_LOG_LINES: del training_log_lines[:-MAX_LOG_LINES]
+
+                em = _ETA_RE.search(line_str)
+                if em:
+                    cur_s, tot_s, _, rate_val, rate_unit = em.groups()
+                    cur_i, tot_i, rate_f = int(cur_s), int(tot_s), float(rate_val)
+                    if cur_i > 0 and rate_f > 0:
+                        remaining = tot_i - cur_i
+                        secs = remaining / rate_f if rate_unit == "it/s" else remaining * rate_f
+                        mins, sec = int(secs // 60), int(secs % 60)
+                        training_eta_text = f"≈ {mins}m {sec:02d}s remaining  ({cur_i}/{tot_i} steps)"
+
+        if training_process is not None:
+            training_process.wait()
+
+        with training_state_lock:
+            training_log_lines.append("✅ Process finished or stopped.")
+
+    except Exception as e:
+        with training_state_lock:
+            training_log_lines.append(f"❌ Error: {str(e)}")
+    finally:
+        log_fh.close()
+        with training_state_lock:
+            training_active = False
+            training_eta_text = ""
+        training_process = None
+
+
+def find_resumable_state(project_out_dir, project_name):
+    """sd-scripts writes '{name}-step{N:08d}-state' per save and '{name}-state' at
+    train end (train_util.STEP_STATE_NAME / LAST_STATE_NAME). Pick the most recently
+    modified one, since a higher step number in the final on-train-end state dir
+    (no step suffix) should still win over an older mid-run step checkpoint."""
+    if not project_out_dir.exists():
+        return None
+    candidates = list(project_out_dir.glob(f"{project_name}-step*-state")) + list(project_out_dir.glob(f"{project_name}-state"))
+    candidates = [c for c in candidates if c.is_dir()]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, optimizer, t_steps, save_steps, sample_steps, pos, neg, w, h, s_steps_gen, s_cfg, s_seed, train_seed, batch_size, grad_acc, side_min=512, side_max=768, resume=True, skip_cache_check=False):
+    global training_process, training_active, training_log_lines, training_eta_text, training_sample_dir, training_last_image_count
 
     model_errors = []
     if not dit_p or not os.path.isfile(dit_p): model_errors.append(f"❌ DiT file not found: {dit_p}")
     if not qwen_p or not os.path.isfile(qwen_p): model_errors.append(f"❌ Qwen3 file not found: {qwen_p}")
     if not vae_p or not os.path.isfile(vae_p): model_errors.append(f"❌ VAE file not found: {vae_p}")
-    
+
     dataset_errors = []
-    if not dataset_path or not os.path.exists(dataset_path): 
+    if not dataset_path or not os.path.exists(dataset_path):
         dataset_errors.append(f"❌ Dataset path not found: {dataset_path}")
     else:
         valid_exts = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
         dataset_path_obj = Path(dataset_path)
         image_files = [f for f in dataset_path_obj.glob('*') if f.is_file() and f.suffix.lower() in valid_exts]
-        
+
         if not image_files:
             dataset_errors.append(f"❌ No valid images found in the dataset path.")
         else:
@@ -768,7 +864,7 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
             missing_captions = [img.name for img in image_files if not img.with_suffix('.txt').exists()]
             if missing_captions:
                 dataset_errors.append(f"❌ Error: Found {len(missing_captions)} images without .txt captions. Please use the 'Auto-Caption Dataset' tool first.")
-            
+
             # Check for oversized images
             oversized_images = []
             for img_path in image_files:
@@ -779,7 +875,7 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
                             oversized_images.append(img.name)
                 except Exception:
                     pass
-            
+
             if oversized_images:
                 dataset_errors.append(f"❌ Error: Found {len(oversized_images)} images that are too large (>= 2048px). Please use the 'Smart Aspect Ratio Bucketing' tool to resize them before training.")
 
@@ -791,8 +887,7 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
         if dataset_errors:
             full_error += "\n".join(dataset_errors)
 
-        yield full_error.strip(), gr.update(), ""
-        return
+        return full_error.strip(), gr.update(), ""
 
     if not torch.cuda.is_available():
         cuda_error = (
@@ -802,12 +897,10 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
             "- Training on CPU is extremely slow and is not supported by this script.\n\n"
             "Please update your NVIDIA drivers and restart the app."
         )
-        yield cuda_error, gr.update(), ""
-        return
+        return cuda_error, gr.update(), ""
 
     if training_process is not None and training_process.poll() is None:
-        yield "⚠️ Training is already running!", gr.update(), ""
-        return
+        return "⚠️ Training is already running!", gr.update(), ""
 
     project_name = re.sub(r'[^a-zA-Z0-9]', '_', trigger_word.strip()).strip('_') or "untitled"
 
@@ -818,36 +911,43 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
     for d in [project_out_dir, sample_dir, project_configs_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
-    log_lines = [f"🚀 Preparing: {project_name}..."]
-    last_image_count = 0
-    step_pattern = re.compile(r"(\d+)/(\d+)")
-    # T4 ETA: matches tqdm rate lines — e.g. "500/1000 [05:12<05:12, 1.60it/s]"
-    _eta_re = re.compile(r'(\d+)/(\d+)\s*\[[\d:]+<([\d:?]+),\s*([\d.]+)(it/s|s/it)\]')
-    eta_text = ""
+    with training_state_lock:
+        training_log_lines = [f"🚀 Preparing: {project_name}..."]
+        training_eta_text = ""
+        training_sample_dir = sample_dir
+        training_last_image_count = 0
 
     # T1c: bucket warning at log start (non-blocking) — use the user's actual Min/Max Side
     bw = check_bucket_batch(dataset_path, batch_size, side_min, side_max)
     if bw:
-        for bw_line in bw.split("\n"):
-            log_lines.append(bw_line)
+        with training_state_lock:
+            for bw_line in bw.split("\n"):
+                training_log_lines.append(bw_line)
 
-    yield "\n".join(log_lines), gr.update(), eta_text
-
-    log_lines.append(f"🔍 Analyzing dataset images...")
+    with training_state_lock:
+        training_log_lines.append("🔍 Analyzing dataset images...")
     base_res, max_bucket = analyze_dataset_resolution(dataset_path)
-    log_lines.append(f"📐 Auto-Resolution Set: Base {base_res}px, Max Bucket {max_bucket}px")
+    with training_state_lock:
+        training_log_lines.append(f"📐 Auto-Resolution Set: Base {base_res}px, Max Bucket {max_bucket}px")
 
     models = {"dit_path": dit_p, "qwen_path": qwen_p, "vae_path": vae_p}
     prompt_path = create_sample_prompts(project_name, trigger_word, pos, neg, w, h, s_steps_gen, s_cfg, s_seed, project_configs_dir)
     dataset_toml = create_dataset_toml(project_name, dataset_path, trigger_word, base_res, max_bucket, project_configs_dir, t_steps, batch_size, grad_acc)
-    training_toml = create_training_toml(project_name, project_configs_dir, project_out_dir, rank, lr, optimizer, t_steps, save_steps, sample_steps, models, prompt_path, train_seed, batch_size, grad_acc)
+    training_toml = create_training_toml(project_name, project_configs_dir, project_out_dir, rank, lr, optimizer, t_steps, save_steps, sample_steps, models, prompt_path, train_seed, batch_size, grad_acc, skip_cache_check)
 
     cmd = [
         str(PORTABLE_PYTHON.resolve()), "-m", "accelerate.commands.launch", "--num_processes=1", "--mixed_precision=bf16", "--dynamo_backend=no",
-        TRAIN_SCRIPT.resolve().as_posix(), 
-        "--config_file", Path(training_toml).resolve().as_posix(), 
+        TRAIN_SCRIPT.resolve().as_posix(),
+        "--config_file", Path(training_toml).resolve().as_posix(),
         "--dataset_config", Path(dataset_toml).resolve().as_posix()
     ]
+
+    if resume:
+        state_dir = find_resumable_state(project_out_dir, project_name)
+        if state_dir is not None:
+            cmd += ["--resume", state_dir.resolve().as_posix()]
+            with training_state_lock:
+                training_log_lines.append(f"🔁 Continuing from checkpoint: {state_dir.name}")
 
     env = os.environ.copy()
     env["PYTHONPATH"] = str(TRAIN_DIR.resolve()) + os.pathsep + env.get("PYTHONPATH", "")
@@ -858,67 +958,52 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
     env["CUDA_VISIBLE_DEVICES"] = "0"
     env["ACCELERATE_USE_CPU"] = "False"
 
+    log_file_path = project_out_dir / "train.log"
+    try:
+        log_file_path.write_text("", encoding="utf-8")
+    except Exception:
+        pass
+
     try:
         training_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1, cwd=str(TRAIN_DIR.resolve()), env=env, encoding="utf-8", errors="ignore")
-        
-        for line in iter(training_process.stdout.readline, ""):
-            line_str = line.replace('\r', '').strip()
-            if not line_str: continue
-
-            if any(skip_word in line_str for skip_word in LOG_BLACKLIST): continue 
-
-            if "subprocess.CalledProcessError" in line_str and "returned non-zero exit status 15" in line_str:
-                log_lines.append("🛑 Interrupted by user.")
-                yield "\n".join(log_lines), gr.update(), eta_text
-                break
-
-            if "steps:" in line_str and "/" in line_str:
-                match = step_pattern.search(line_str)
-                if match:
-                    current_step_info = match.group(0)
-                    if log_lines and "steps:" in log_lines[-1] and current_step_info in log_lines[-1]:
-                        log_lines[-1] = line_str
-                    else:
-                        log_lines.append(line_str)
-                else:
-                    log_lines.append(line_str)
-            else:
-                log_lines.append(line_str)
-
-            if len(log_lines) > MAX_LOG_LINES: del log_lines[:-MAX_LOG_LINES]
-
-            # T4: ETA from tqdm rate field
-            em = _eta_re.search(line_str)
-            if em:
-                cur_s, tot_s, _, rate_val, rate_unit = em.groups()
-                cur_i, tot_i, rate_f = int(cur_s), int(tot_s), float(rate_val)
-                if cur_i > 0 and rate_f > 0:
-                    remaining = tot_i - cur_i
-                    secs = remaining / rate_f if rate_unit == "it/s" else remaining * rate_f
-                    mins, sec = int(secs // 60), int(secs % 60)
-                    eta_text = f"≈ {mins}m {sec:02d}s remaining  ({cur_i}/{tot_i} steps)"
-
-            check_image = any(x in line_str.lower() for x in ["saved", "sample", "%|", "it/s", "s/it"])
-            if check_image:
-                current_images = get_latest_images(sample_dir)
-                if len(current_images) != last_image_count:
-                    last_image_count = len(current_images)
-                    yield "\n".join(log_lines), current_images, eta_text
-                    continue
-
-            yield "\n".join(log_lines), gr.update(), eta_text
-
-        if training_process is not None:
-            training_process.wait()
-
-        log_lines.append("✅ Process finished or stopped.")
-        yield "\n".join(log_lines), get_latest_images(sample_dir), ""
-
+        training_active = True
+        threading.Thread(target=_training_worker, args=(log_file_path,), daemon=True).start()
     except Exception as e:
-        log_lines.append(f"❌ Error: {str(e)}")
-        yield "\n".join(log_lines), gr.update(), ""
-    finally:
+        with training_state_lock:
+            training_log_lines.append(f"❌ Error: {str(e)}")
+        training_active = False
         training_process = None
+
+    with training_state_lock:
+        return "\n".join(training_log_lines), gr.update(), training_eta_text
+
+
+def poll_training_status(sort_mode="Latest"):
+    """Bound to a gr.Timer and to ui.load, so the log/preview/ETA reflect the
+    module-level training state regardless of which browser request is asking —
+    this is what lets a still-running subprocess survive a page refresh."""
+    global training_last_image_count
+    with training_state_lock:
+        log_text = "\n".join(training_log_lines)
+        eta = training_eta_text
+        sample_dir = training_sample_dir
+        active = training_active
+        last_count = training_last_image_count
+
+    if not active and not log_text:
+        return gr.update(), gr.update(), gr.update()
+
+    gallery_update = gr.update()
+    # "By Step" mode is refreshed manually (needs a checkpoint-matching pass); don't
+    # fight the user's chosen view with the recency-sorted "Latest" auto-refresh.
+    if sample_dir is not None and sort_mode == "Latest":
+        imgs = get_latest_images(sample_dir)
+        if len(imgs) != last_count:
+            training_last_image_count = len(imgs)
+            gallery_update = imgs
+
+    return log_text, gallery_update, eta
+
 
 def stop_training():
     global training_process
@@ -1123,6 +1208,18 @@ def get_ab_gallery(trigger_word):
     return result
 
 
+def refresh_gallery_for_mode(sort_mode, trigger_word):
+    """Single gallery, two renderers over the same on-disk sample folder:
+    'Latest' = recency-sorted, unlabeled (for eyeballing progress mid-run);
+    'By Step' = step-sorted, labeled with the matching checkpoint (for comparing
+    a run's history after the fact). Replaces the old separate A/B gallery widget."""
+    if sort_mode == "By Step":
+        return get_ab_gallery(trigger_word)
+    if training_sample_dir is not None:
+        return get_latest_images(training_sample_dir)
+    return []
+
+
 # ==========================================
 # Misc — Caption editor helpers
 # ==========================================
@@ -1184,6 +1281,11 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
                     stop_btn = gr.Button("🛑 Stop", variant="stop")
                     folder_btn = gr.Button("📁 Checkpoint Folder", variant="secondary")
                     copy_path_btn = gr.Button("📋 Copy Output Path", variant="secondary")
+                resume_checkbox = gr.Checkbox(label="🔁 Continue from last checkpoint if one exists for this project", value=True)
+                skip_cache_check_checkbox = gr.Checkbox(
+                    label="⚡ Skip cache validity check on start (faster, but only safe if the dataset images/captions haven't changed since the last cache)",
+                    value=False,
+                )
                 output_path_display = gr.Textbox(label="Output Path", interactive=False, lines=1, elem_id="output-path-box")
             with gr.Column(scale=1):
                 with gr.Row():
@@ -1244,10 +1346,10 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
 
 
         with gr.Column(scale=1):
-            preview_gallery = gr.Gallery(label="Live Previews", columns=2, rows=2, height=GALLERY_HEIGHT, object_fit="contain")
-            with gr.Accordion("📸 Checkpoint A/B Gallery", open=False):
-                refresh_ab_btn = gr.Button("🔄 Refresh Gallery", variant="secondary")
-                ab_gallery = gr.Gallery(label="Samples by Step", columns=3, rows=3, height=400, object_fit="contain", show_label=False)
+            with gr.Row():
+                gallery_sort = gr.Radio(choices=["Latest", "By Step"], value="Latest", label="Sort", scale=2, min_width=160)
+                refresh_ab_btn = gr.Button("🔄 Refresh", variant="secondary", scale=1)
+            preview_gallery = gr.Gallery(label="Sample Previews", columns=2, rows=2, height=GALLERY_HEIGHT, object_fit="contain")
             with gr.Group():
                 pos_prompt = gr.Textbox(label="Prompt (Trigger word added automatically)", lines=2, value=cs.get("pos_prompt", ""))
                 neg_prompt = gr.Textbox(label="Negative Prompt", lines=1, value=cs.get("neg_prompt", ""))
@@ -1274,7 +1376,16 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
         current_settings = load_settings()
         return [current_settings.get(k, DEFAULT_SETTINGS[k]) for k in DEFAULT_SETTINGS.keys()]
 
-    ui.load(fn=load_state_on_refresh, inputs=None, outputs=all_settings_list)    
+    ui.load(fn=load_state_on_refresh, inputs=None, outputs=all_settings_list)
+
+    # Polls module-level training state (survives page refresh — the subprocess
+    # itself is never tied to a browser session) so log/preview/ETA rehydrate
+    # instantly on load and keep updating even if the original click request died.
+    training_timer = gr.Timer(1.0, active=True)
+    training_timer.tick(fn=poll_training_status, inputs=[gallery_sort], outputs=[output_log, preview_gallery, eta_output])
+    ui.load(fn=poll_training_status, inputs=[gallery_sort], outputs=[output_log, preview_gallery, eta_output])
+
+    gallery_sort.change(fn=refresh_gallery_for_mode, inputs=[gallery_sort, trigger_word], outputs=[preview_gallery])
 
     output_log.change(None, None, None, js=JS_SCROLL)
 
@@ -1324,11 +1435,11 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
         outputs=[output_log]
     )
 
-    # T3: A/B checkpoint gallery
-    refresh_ab_btn.click(fn=get_ab_gallery, inputs=[trigger_word], outputs=[ab_gallery])
+    # T3: sample preview gallery — manual refresh respects the current sort mode
+    refresh_ab_btn.click(fn=refresh_gallery_for_mode, inputs=[gallery_sort, trigger_word], outputs=[preview_gallery])
 
     # T4: ETA wired as third output of start_training
-    start_btn.click(fn=start_training, inputs=training_inputs + [side_min_input, side_max_input], outputs=[output_log, preview_gallery, eta_output])
+    start_btn.click(fn=start_training, inputs=training_inputs + [side_min_input, side_max_input, resume_checkbox, skip_cache_check_checkbox], outputs=[output_log, preview_gallery, eta_output])
     stop_btn.click(fn=stop_training, outputs=output_log)
     folder_btn.click(fn=open_output_folder, inputs=[trigger_word], outputs=output_log)
 
